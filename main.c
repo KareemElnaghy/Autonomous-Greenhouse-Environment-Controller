@@ -27,7 +27,7 @@
 #include "queue.h"
 #define SOIL_DRY_THRESHOLD 2500
 #define Hours_toWater 6
-#define WATER_EMPTY_THRESHOLD 500
+#define WATER_EMPTY_THRESHOLD 750
 
 /* USER CODE END Includes */
 
@@ -499,6 +499,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(LD3_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+	HAL_GPIO_WritePin(GPIOA, GPIO_Water_Pin, GPIO_PIN_SET);   // relay OFF at boot
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
@@ -607,7 +608,7 @@ void StartWatering(void *argument)
 							osDelay(5000);
 							HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
 							osSemaphoreRelease(WorkingSemaphoreHandle);
-							osTimerStart(TimerwaterHandle, pdMS_TO_TICKS(60000));
+							osTimerStart(TimerwaterHandle, pdMS_TO_TICKS(10000)); // 5 second cooldown
 							
 					}
 				}
