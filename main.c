@@ -27,6 +27,8 @@
 #include "queue.h"
 #define SOIL_DRY_THRESHOLD 2500
 #define Hours_toWater 6
+#define WATER_EMPTY_THRESHOLD 500
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -94,7 +96,9 @@ const osSemaphoreAttr_t WorkingSemaphore_attributes = {
 };
 /* USER CODE BEGIN PV */
 volatile uint8_t wateringAllowed = 1;
+volatile uint8_t tankEmpty  = 0;
 volatile uint8_t lcdReady = 0;
+
 osMutexId_t lcdMutexHandle;
 
 /* USER CODE END PV */
@@ -125,6 +129,27 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
         xQueueSendFromISR(RQHandle, &soilValue, &xHigherPriorityTaskWoken);
         portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
     }
+}
+
+uint16_t ReadWaterLevel(void) {
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = ADC_CHANNEL_12;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+    sConfig.SingleDiff = ADC_SINGLE_ENDED;
+    sConfig.OffsetNumber = ADC_OFFSET_NONE;
+    sConfig.Offset = 0;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
+    uint16_t val = (uint16_t)HAL_ADC_GetValue(&hadc1);
+
+    // switch back to soil moisture
+    sConfig.Channel = ADC_CHANNEL_6;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+    return val;
 }
 
 /* USER CODE END 0 */
@@ -454,13 +479,13 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_Fertilizer_Pin|GPIO_Water_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_Fertilizer_Pin|GPIO_Water_Pin|GPIO_OP_Buzzer_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : GPIO_Fertilizer_Pin GPIO_Water_Pin */
-  GPIO_InitStruct.Pin = GPIO_Fertilizer_Pin|GPIO_Water_Pin;
+  /*Configure GPIO pins : GPIO_Fertilizer_Pin GPIO_Water_Pin GPIO_OP_Buzzer_Pin */
+  GPIO_InitStruct.Pin = GPIO_Fertilizer_Pin|GPIO_Water_Pin|GPIO_OP_Buzzer_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -524,12 +549,12 @@ void StartWatering(void *argument)
 {
   /* USER CODE BEGIN StartWatering */
   while (!lcdReady) { osDelay(10); }
-  osDelay(2500);  // let startup message finish displaying
-
+  osDelay(2500);
   uint16_t soilvalue;
+  uint16_t waterLevel;
   char buffer[20];
+	char buffer1[20];
   char lcdLine[17];
-
   for(;;)
   {
     HAL_ADC_Start_IT(&hadc1);
@@ -537,11 +562,9 @@ void StartWatering(void *argument)
 
     // -- LCD update protected by mutex --
     osMutexAcquire(lcdMutexHandle, osWaitForever);
-
     LCD_SetCursor(0, 0);
     snprintf(lcdLine, sizeof(lcdLine), "Soil: %-5u RAW", soilvalue);
     LCD_Print(lcdLine);
-
     LCD_SetCursor(1, 0);
     if (!wateringAllowed) {
         LCD_Print("Cooldown...     ");
@@ -550,34 +573,52 @@ void StartWatering(void *argument)
     } else {
         LCD_Print("Status: OK      ");
     }
-
     osMutexRelease(lcdMutexHandle);
 
-    // -- watering logic --
-    if (soilvalue > SOIL_DRY_THRESHOLD && wateringAllowed) {
-        if (osSemaphoreAcquire(WorkingSemaphoreHandle, 0) == osOK) {
-            wateringAllowed = 0;
-
-            osMutexAcquire(lcdMutexHandle, osWaitForever);
-            LCD_SetCursor(1, 0);
-            LCD_Print("Watering...     ");
-            osMutexRelease(lcdMutexHandle);
-
-            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
-            osDelay(5000); // 5 seconds
-            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
-
-            osSemaphoreRelease(WorkingSemaphoreHandle);
-            osTimerStart(TimerwaterHandle, pdMS_TO_TICKS(60000)); // 1 minute cooldown
-        }
+		// check water level first
+		waterLevel = ReadWaterLevel();
+			int len1 = snprintf(buffer1, sizeof(buffer1), "water: %u\r\n", waterLevel);
+			HAL_UART_Transmit(&huart2, (uint8_t*)buffer1, len1, 100);
+		osDelay(1000);
+		if (waterLevel < WATER_EMPTY_THRESHOLD) {
+			tankEmpty = 1;
+			osMutexAcquire(lcdMutexHandle, osWaitForever);
+			LCD_SetCursor(1, 0);
+			LCD_Print("Tank Empty!     ");
+			osDelay(3000);
+			osMutexRelease(lcdMutexHandle);
+			HAL_UART_Transmit(&huart2, (uint8_t*)"TANK EMPTY\r\n", 12, 100);
+				
+    } else {
+        tankEmpty = 0; // clears automatically when tank is refilled
     }
+	
+			// -- watering logic --
+			if (soilvalue > SOIL_DRY_THRESHOLD && wateringAllowed && !tankEmpty) {
+				{
+					if (osSemaphoreAcquire(WorkingSemaphoreHandle, 0) == osOK) {
+							wateringAllowed = 0;
+							osMutexAcquire(lcdMutexHandle, osWaitForever);
+							LCD_SetCursor(1, 0);
+							LCD_Print("Watering...     ");
+							osMutexRelease(lcdMutexHandle);
+							osDelay(6000); // delay before watering 
+							HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+							osDelay(5000);
+							HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+							osSemaphoreRelease(WorkingSemaphoreHandle);
+							osTimerStart(TimerwaterHandle, pdMS_TO_TICKS(60000));
+							
+					}
+				}
 
-    // -- UART debug --
-    int len = snprintf(buffer, sizeof(buffer), "Soil: %u\r\n", soilvalue);
-    HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
-    osDelay(1000);
-  }
+			// -- UART debug --
+			int len = snprintf(buffer, sizeof(buffer), "Soil: %u\r\n", soilvalue);
+			HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
+			osDelay(1000);
+		}
   /* USER CODE END StartWatering */
+	}
 }
 
 /* USER CODE BEGIN Header_StartFertilizer */
