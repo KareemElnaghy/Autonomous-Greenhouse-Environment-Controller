@@ -22,8 +22,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "queue.h"
 #include "stdio.h"
+#include "lcd_i2c.h"
+#include "queue.h"
 #define SOIL_DRY_THRESHOLD 2500
 #define Hours_toWater 6
 /* USER CODE END Includes */
@@ -45,6 +46,8 @@
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
+
+I2C_HandleTypeDef hi2c1;
 
 UART_HandleTypeDef huart2;
 
@@ -91,6 +94,9 @@ const osSemaphoreAttr_t WorkingSemaphore_attributes = {
 };
 /* USER CODE BEGIN PV */
 volatile uint8_t wateringAllowed = 1;
+volatile uint8_t lcdReady = 0;
+osMutexId_t lcdMutexHandle;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -98,6 +104,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_I2C1_Init(void);
 void StartDefaultTask(void *argument);
 void StartWatering(void *argument);
 void StartFertilizer(void *argument);
@@ -153,6 +160,7 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_ADC1_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -162,6 +170,8 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
+	lcdMutexHandle = osMutexNew(NULL);
+
   /* USER CODE END RTOS_MUTEX */
 
   /* Create the semaphores(s) */
@@ -344,6 +354,54 @@ static void MX_ADC1_Init(void)
 }
 
 /**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x00B07CB4;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -434,11 +492,24 @@ static void MX_GPIO_Init(void)
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
+  osDelay(100);
+  LCD_Init(&hi2c1);
+  lcdReady = 1;
+
+  osMutexAcquire(lcdMutexHandle, osWaitForever);
+  LCD_SetCursor(0, 0);
+  LCD_Print("  Greenhouse    ");
+  LCD_SetCursor(1, 0);
+  LCD_Print("  Starting...   ");
+  osMutexRelease(lcdMutexHandle);
+
+  osDelay(2000);
+
+  osMutexAcquire(lcdMutexHandle, osWaitForever);
+  LCD_Clear();
+  osMutexRelease(lcdMutexHandle);
+
+  for(;;) { osDelay(1000); }
   /* USER CODE END 5 */
 }
 
@@ -452,26 +523,56 @@ void StartDefaultTask(void *argument)
 void StartWatering(void *argument)
 {
   /* USER CODE BEGIN StartWatering */
+  while (!lcdReady) { osDelay(10); }
+  osDelay(2500);  // let startup message finish displaying
+
   uint16_t soilvalue;
   char buffer[20];
+  char lcdLine[17];
 
-  /* Infinite loop */
   for(;;)
   {
     HAL_ADC_Start_IT(&hadc1);
     osMessageQueueGet(RQHandle, &soilvalue, NULL, osWaitForever);
 
+    // -- LCD update protected by mutex --
+    osMutexAcquire(lcdMutexHandle, osWaitForever);
+
+    LCD_SetCursor(0, 0);
+    snprintf(lcdLine, sizeof(lcdLine), "Soil: %-5u RAW", soilvalue);
+    LCD_Print(lcdLine);
+
+    LCD_SetCursor(1, 0);
+    if (!wateringAllowed) {
+        LCD_Print("Cooldown...     ");
+    } else if (soilvalue > SOIL_DRY_THRESHOLD) {
+        LCD_Print("Status: DRY     ");
+    } else {
+        LCD_Print("Status: OK      ");
+    }
+
+    osMutexRelease(lcdMutexHandle);
+
+    // -- watering logic --
     if (soilvalue > SOIL_DRY_THRESHOLD && wateringAllowed) {
         if (osSemaphoreAcquire(WorkingSemaphoreHandle, 0) == osOK) {
-						wateringAllowed = 0;
+            wateringAllowed = 0;
+
+            osMutexAcquire(lcdMutexHandle, osWaitForever);
+            LCD_SetCursor(1, 0);
+            LCD_Print("Watering...     ");
+            osMutexRelease(lcdMutexHandle);
+
             HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
-            osDelay(5000); // water for 5 seconds
+            osDelay(5000); // 5 seconds
             HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+
             osSemaphoreRelease(WorkingSemaphoreHandle);
-            osTimerStart(TimerwaterHandle, pdMS_TO_TICKS(60000)); // cool down for 1 min (variable)
+            osTimerStart(TimerwaterHandle, pdMS_TO_TICKS(60000)); // 1 minute cooldown
         }
     }
 
+    // -- UART debug --
     int len = snprintf(buffer, sizeof(buffer), "Soil: %u\r\n", soilvalue);
     HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
     osDelay(1000);
