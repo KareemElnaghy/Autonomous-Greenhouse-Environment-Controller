@@ -28,7 +28,7 @@
 #define SOIL_DRY_THRESHOLD 2500
 #define Hours_toWater 6
 #define WATER_EMPTY_THRESHOLD 750
-#define LIGHT_LOW_THRESHOLD   100
+#define LIGHT_LOW_THRESHOLD   3500
 #define LIGHT_CHECK_INTERVAL  5000
 
 /* USER CODE END Includes */
@@ -657,7 +657,7 @@ void StartDefaultTask(void *argument)
   for(;;)
   {
     if (currentScreen != lastScreen) {
-        // screen just changed — clear display
+        // screen just changed â€” clear display
         osMutexAcquire(lcdMutexHandle, osWaitForever);
         LCD_Clear();
         osMutexRelease(lcdMutexHandle);
@@ -787,20 +787,31 @@ void StartLightCtrl(void *argument)
 
   uint16_t lightValue;
   char buffer[40];
+	uint32_t duty;
+	float psc;
+	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
 
   for(;;)
   {
     lightValue = ReadLightLevel();
     g_lastLightValue = lightValue;
+			psc = (320000/100) - 1 ;
+	// set a prescaler value for the intended timer
+	  __HAL_TIM_SET_PRESCALER(&htim1,psc);
 		
 		char dbg[30];
-int dlen = snprintf(dbg, sizeof(dbg), "LightRaw: %u\r\n", lightValue);
-HAL_UART_Transmit(&huart2, (uint8_t*)dbg, dlen, 100);
+		int dlen = snprintf(dbg, sizeof(dbg), "LightRaw: %u\r\n", lightValue);
+		HAL_UART_Transmit(&huart2, (uint8_t*)dbg, dlen, 100);
 
     if (lightValue < LIGHT_LOW_THRESHOLD) {
-        HAL_GPIO_WritePin(GPIO_Light_GPIO_Port, GPIO_Light_Pin, GPIO_PIN_SET);
+			  duty = (uint32_t)(99.0f * (1.0f - (lightValue / 5000.0f)));
+        if (duty > 99) duty = 99;
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty);
+			int len = snprintf(buffer, sizeof(buffer), "duty: %u\r\n", duty);
+    HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
+       
     } else {
-        HAL_GPIO_WritePin(GPIO_Light_GPIO_Port, GPIO_Light_Pin, GPIO_PIN_RESET);
+         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
     }
 
     int len = snprintf(buffer, sizeof(buffer), "Light: %u\r\n", lightValue);
