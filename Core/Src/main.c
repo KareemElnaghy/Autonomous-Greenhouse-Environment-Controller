@@ -25,12 +25,14 @@
 #include "stdio.h"
 #include "lcd_i2c.h"
 #include "queue.h"
+#include "string.h"
 #define SOIL_DRY_THRESHOLD 2500
 #define Hours_toWater 6
 #define WATER_EMPTY_THRESHOLD 750
 #define LIGHT_LOW_THRESHOLD   3500
 #define LIGHT_CHECK_INTERVAL  5000
-
+#define TEMP_COOL_MAX  24
+#define TEMP_WARM_MAX  34
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -54,6 +56,7 @@ ADC_HandleTypeDef hadc1;
 I2C_HandleTypeDef hi2c1;
 
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim2;
 
 UART_HandleTypeDef huart2;
 
@@ -61,7 +64,7 @@ UART_HandleTypeDef huart2;
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 256 * 4,
+  .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for Watering */
@@ -69,20 +72,20 @@ osThreadId_t WateringHandle;
 const osThreadAttr_t Watering_attributes = {
   .name = "Watering",
   .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityBelowNormal,
-};
-/* Definitions for Fertilizer */
-osThreadId_t FertilizerHandle;
-const osThreadAttr_t Fertilizer_attributes = {
-  .name = "Fertilizer",
-  .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
 /* Definitions for LightCtrl */
 osThreadId_t LightCtrlHandle;
 const osThreadAttr_t LightCtrl_attributes = {
   .name = "LightCtrl",
-  .stack_size = 256 * 4,
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for ClimateCtrl */
+osThreadId_t ClimateCtrlHandle;
+const osThreadAttr_t ClimateCtrl_attributes = {
+  .name = "ClimateCtrl",
+  .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
 /* Definitions for RQ */
@@ -94,11 +97,6 @@ const osMessageQueueAttr_t RQ_attributes = {
 osTimerId_t TimerwaterHandle;
 const osTimerAttr_t Timerwater_attributes = {
   .name = "Timerwater"
-};
-/* Definitions for TimerFertilizer */
-osTimerId_t TimerFertilizerHandle;
-const osTimerAttr_t TimerFertilizer_attributes = {
-  .name = "TimerFertilizer"
 };
 /* Definitions for ScreenToggleTimer */
 osTimerId_t ScreenToggleTimerHandle;
@@ -119,22 +117,23 @@ osMutexId_t lcdMutexHandle;
 volatile uint16_t g_lastSoilValue  = 0;
 volatile uint16_t g_lastWaterLevel = 0;
 volatile uint16_t g_lastLightValue = 0;
-
+volatile int16_t g_lastTemperature = 0;
+volatile int16_t g_lastHumidity = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM1_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_TIM2_Init(void);
 void StartDefaultTask(void *argument);
 void StartWatering(void *argument);
-void StartFertilizer(void *argument);
 void StartLightCtrl(void *argument);
+void StartClimateCtrl(void *argument);
 void Callback01(void *argument);
-void Callback02(void *argument);
 void ScreenToggleCallback(void *argument);
 
 /* USER CODE BEGIN PFP */
@@ -143,6 +142,7 @@ void ScreenToggleCallback(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     if (hadc->Instance == ADC1) {
         uint16_t soilValue = (uint16_t)HAL_ADC_GetValue(&hadc1);
@@ -196,6 +196,88 @@ uint16_t ReadLightLevel(void) {
     return val;
 }
 
+
+
+static void delay_us(uint16_t us) {
+    __HAL_TIM_SET_COUNTER(&htim2, 0);
+    while (__HAL_TIM_GET_COUNTER(&htim2) < us);
+}
+
+static int DHT11_Read(int16_t *temperature, int16_t *humidity) {
+    uint8_t data[5] = {0};
+    uint16_t wait;
+    GPIO_InitTypeDef gpio = {0};
+
+    // --- Start signal: pull LOW >= 18ms (interrupts enabled for HAL_Delay) ---
+    gpio.Pin = GPIO_DHT_Pin;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIO_DHT_GPIO_Port, &gpio);
+    HAL_GPIO_WritePin(GPIO_DHT_GPIO_Port, GPIO_DHT_Pin, GPIO_PIN_RESET);
+    HAL_Delay(20);
+    HAL_GPIO_WritePin(GPIO_DHT_GPIO_Port, GPIO_DHT_Pin, GPIO_PIN_SET);
+    delay_us(30);  // hold HIGH for exactly 30µs
+
+    // Then switch to input with pull-up to wait for DHT response
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIO_DHT_GPIO_Port, &gpio);
+
+    // --- Critical timing: disable interrupts ---
+    __disable_irq();
+
+    // Wait for DHT response (LOW 80us)
+    wait = 0;
+    while (HAL_GPIO_ReadPin(GPIO_DHT_GPIO_Port, GPIO_DHT_Pin)) {
+        if (++wait > 200) { __enable_irq(); return -1; }
+        delay_us(1);
+    }
+    // Wait for DHT response (HIGH 80us)
+    wait = 0;
+    while (!HAL_GPIO_ReadPin(GPIO_DHT_GPIO_Port, GPIO_DHT_Pin)) {
+        if (++wait > 200) { __enable_irq(); return -1; }
+        delay_us(1);
+    }
+    wait = 0;
+    while (HAL_GPIO_ReadPin(GPIO_DHT_GPIO_Port, GPIO_DHT_Pin)) {
+        if (++wait > 200) { __enable_irq(); return -1; }
+        delay_us(1);
+    }
+
+    // Read 40 bits (5 bytes)
+    for (int i = 0; i < 5; i++) {
+        for (int j = 0; j < 8; j++) {
+            wait = 0;
+            while (!HAL_GPIO_ReadPin(GPIO_DHT_GPIO_Port, GPIO_DHT_Pin)) {
+                if (++wait > 200) { __enable_irq(); return -1; }
+                delay_us(1);
+            }
+            delay_us(40);
+            if (HAL_GPIO_ReadPin(GPIO_DHT_GPIO_Port, GPIO_DHT_Pin)) {
+                data[i] = (data[i] << 1) | 1;
+                wait = 0;
+                while (HAL_GPIO_ReadPin(GPIO_DHT_GPIO_Port, GPIO_DHT_Pin)) {
+                    if (++wait > 200) { __enable_irq(); return -1; }
+                    delay_us(1);
+                }
+            } else {
+                data[i] = (data[i] << 1) | 0;
+            }
+        }
+    }
+
+    __enable_irq();
+
+    // Checksum
+    uint8_t sum = data[0] + data[1] + data[2] + data[3];
+    if (sum != data[4]) return -2;
+
+    *humidity  = data[0];
+    *temperature = data[2];
+    return 0;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -227,10 +309,11 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_USART2_UART_Init();
   MX_ADC1_Init();
   MX_I2C1_Init();
   MX_TIM1_Init();
+  MX_USART2_UART_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -239,9 +322,7 @@ int main(void)
   osKernelInitialize();
 
   /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
-	lcdMutexHandle = osMutexNew(NULL);
-
+  lcdMutexHandle = osMutexNew(NULL);
   /* USER CODE END RTOS_MUTEX */
 
   /* Create the semaphores(s) */
@@ -256,14 +337,10 @@ int main(void)
   /* creation of Timerwater */
   TimerwaterHandle = osTimerNew(Callback01, osTimerOnce, NULL, &Timerwater_attributes);
 
-  /* creation of TimerFertilizer */
-  TimerFertilizerHandle = osTimerNew(Callback02, osTimerPeriodic, NULL, &TimerFertilizer_attributes);
-
   /* creation of ScreenToggleTimer */
   ScreenToggleTimerHandle = osTimerNew(ScreenToggleCallback, osTimerPeriodic, NULL, &ScreenToggleTimer_attributes);
 
   /* USER CODE BEGIN RTOS_TIMERS */
-	osTimerStart(ScreenToggleTimerHandle, pdMS_TO_TICKS(5000));
   /* USER CODE END RTOS_TIMERS */
 
   /* Create the queue(s) */
@@ -281,11 +358,11 @@ int main(void)
   /* creation of Watering */
   WateringHandle = osThreadNew(StartWatering, NULL, &Watering_attributes);
 
-  /* creation of Fertilizer */
-  FertilizerHandle = osThreadNew(StartFertilizer, NULL, &Fertilizer_attributes);
-
   /* creation of LightCtrl */
   LightCtrlHandle = osThreadNew(StartLightCtrl, NULL, &LightCtrl_attributes);
+
+  /* creation of ClimateCtrl */
+  ClimateCtrlHandle = osThreadNew(StartClimateCtrl, NULL, &ClimateCtrl_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -525,6 +602,10 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
   sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
   sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
@@ -544,6 +625,52 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+  htim2.Init.Prescaler = (SystemCoreClock / 1000000) - 1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 31;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 65535;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+  HAL_TIM_Base_Start(&htim2);
+  /* USER CODE END TIM2_Init 2 */
 
 }
 
@@ -591,7 +718,7 @@ static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
-
+	
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
@@ -600,20 +727,20 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_Fertilizer_Pin|GPIO_Water_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIO_Water_GPIO_Port, GPIO_Water_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, LD3_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_DHT_Pin|LD3_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : GPIO_Fertilizer_Pin GPIO_Water_Pin */
-  GPIO_InitStruct.Pin = GPIO_Fertilizer_Pin|GPIO_Water_Pin;
+  /*Configure GPIO pin : GPIO_Water_Pin */
+  GPIO_InitStruct.Pin = GPIO_Water_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIO_Water_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins :  LD3_Pin */
-  GPIO_InitStruct.Pin = LD3_Pin;
+  /*Configure GPIO pins : GPIO_DHT_Pin LD3_Pin */
+  GPIO_InitStruct.Pin = GPIO_DHT_Pin|LD3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -621,7 +748,12 @@ static void MX_GPIO_Init(void)
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 	HAL_GPIO_WritePin(GPIOA, GPIO_Water_Pin, GPIO_PIN_SET);   // relay OFF at boot
-
+	GPIO_InitStruct.Pin = GPIO_PIN_10;
+	GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	GPIO_InitStruct.Alternate = GPIO_AF1_TIM1;
+	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -649,6 +781,7 @@ void StartDefaultTask(void *argument)
   LCD_SetCursor(1, 0);
   LCD_Print("  Starting...   ");
   osMutexRelease(lcdMutexHandle);
+  osTimerStart(ScreenToggleTimerHandle, pdMS_TO_TICKS(5000));  
 
   osDelay(2000);
 
@@ -657,7 +790,7 @@ void StartDefaultTask(void *argument)
   for(;;)
   {
     if (currentScreen != lastScreen) {
-        // screen just changed — clear display
+        // screen just changed � clear display
         osMutexAcquire(lcdMutexHandle, osWaitForever);
         LCD_Clear();
         osMutexRelease(lcdMutexHandle);
@@ -682,11 +815,19 @@ void StartDefaultTask(void *argument)
             snprintf(line1, sizeof(line1), "Tank:%-5u OK   ", g_lastWaterLevel);
             LCD_Print(line1);
         }
-    } else {
+    } else if (currentScreen == 1) {
         char line0[17], line1[17];
         snprintf(line0, sizeof(line0), "Lux: %-5u      ", g_lastLightValue);
         snprintf(line1, sizeof(line1), "Strip: %s       ",
                  g_lastLightValue < LIGHT_LOW_THRESHOLD ? "ON " : "OFF");
+        LCD_SetCursor(0, 0);
+        LCD_Print(line0);
+        LCD_SetCursor(1, 0);
+        LCD_Print(line1);
+    } else {
+        char line0[17], line1[17];
+        snprintf(line0, sizeof(line0), "Temp: %-3dC       ", g_lastTemperature);
+        snprintf(line1, sizeof(line1), "Hum:  %-3d%%       ", g_lastHumidity);
         LCD_SetCursor(0, 0);
         LCD_Print(line0);
         LCD_SetCursor(1, 0);
@@ -755,24 +896,6 @@ void StartWatering(void *argument)
   /* USER CODE END StartWatering */
 }
 
-/* USER CODE BEGIN Header_StartFertilizer */
-/**
-* @brief Function implementing the Fertilizer thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartFertilizer */
-void StartFertilizer(void *argument)
-{
-  /* USER CODE BEGIN StartFertilizer */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartFertilizer */
-}
-
 /* USER CODE BEGIN Header_StartLightCtrl */
 /**
 * @brief Function implementing the LightCtrl thread.
@@ -822,27 +945,65 @@ void StartLightCtrl(void *argument)
   /* USER CODE END StartLightCtrl */
 }
 
+/* USER CODE BEGIN Header_StartClimateCtrl */
+/**
+* @brief Function implementing the ClimateCtrl thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartClimateCtrl */
+void StartClimateCtrl(void *argument)
+{
+  /* USER CODE BEGIN StartClimateCtrl */
+  int16_t temperature, humidity;
+  char buf[40];
+  int ret;
+
+  while (!lcdReady) { osDelay(10); }
+  osDelay(3000);
+
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+
+  for(;;)
+  {
+    ret = DHT11_Read(&temperature, &humidity);
+    if (ret == 0) {
+        g_lastTemperature = temperature;
+        g_lastHumidity = humidity;
+        int len = snprintf(buf, sizeof(buf), "Temp:%dC Hum:%d%%\r\n", temperature, humidity);
+        HAL_UART_Transmit(&huart2, (uint8_t*)buf, len, 100);
+
+        if (temperature <= TEMP_COOL_MAX) {
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
+            HAL_UART_Transmit(&huart2, (uint8_t*)"Fan: OFF\r\n", 10, 100);
+        } else if (temperature <= TEMP_WARM_MAX) {
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 49);
+            HAL_UART_Transmit(&huart2, (uint8_t*)"Fan: 50%\r\n", 10, 100);
+        } else {
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 99);
+            HAL_UART_Transmit(&huart2, (uint8_t*)"Fan: 100%\r\n", 11, 100);
+        }
+    } else {
+        HAL_UART_Transmit(&huart2, (uint8_t*)"DHT11 FAIL\r\n", 12, 100);
+    }
+    osDelay(4000);
+  }
+  /* USER CODE END StartClimateCtrl */
+}
+
 /* Callback01 function */
 void Callback01(void *argument)
 {
   /* USER CODE BEGIN Callback01 */
-		wateringAllowed = 1;
+  wateringAllowed = 1;
   /* USER CODE END Callback01 */
-}
-
-/* Callback02 function */
-void Callback02(void *argument)
-{
-  /* USER CODE BEGIN Callback02 */
-
-  /* USER CODE END Callback02 */
 }
 
 /* ScreenToggleCallback function */
 void ScreenToggleCallback(void *argument)
 {
   /* USER CODE BEGIN ScreenToggleCallback */
-    currentScreen = (currentScreen == 0) ? 1 : 0;
+	currentScreen = (currentScreen >= 2) ? 0 : (currentScreen + 1);
   /* USER CODE END ScreenToggleCallback */
 }
 
