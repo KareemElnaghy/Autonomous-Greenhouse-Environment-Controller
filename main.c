@@ -25,10 +25,12 @@
 #include "stdio.h"
 #include "lcd_i2c.h"
 #include "queue.h"
+#include "string.h"
 #define SOIL_DRY_THRESHOLD 2500
 #define Hours_toWater 6
 #define WATER_EMPTY_THRESHOLD 750
-
+#define LIGHT_LOW_THRESHOLD   3500
+#define LIGHT_CHECK_INTERVAL  5000
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -51,13 +53,15 @@ ADC_HandleTypeDef hadc1;
 
 I2C_HandleTypeDef hi2c1;
 
+TIM_HandleTypeDef htim1;
+
 UART_HandleTypeDef huart2;
 
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
+  .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for Watering */
@@ -65,12 +69,12 @@ osThreadId_t WateringHandle;
 const osThreadAttr_t Watering_attributes = {
   .name = "Watering",
   .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityBelowNormal,
+  .priority = (osPriority_t) osPriorityLow,
 };
-/* Definitions for Fertilizer */
-osThreadId_t FertilizerHandle;
-const osThreadAttr_t Fertilizer_attributes = {
-  .name = "Fertilizer",
+/* Definitions for LightCtrl */
+osThreadId_t LightCtrlHandle;
+const osThreadAttr_t LightCtrl_attributes = {
+  .name = "LightCtrl",
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
@@ -84,10 +88,10 @@ osTimerId_t TimerwaterHandle;
 const osTimerAttr_t Timerwater_attributes = {
   .name = "Timerwater"
 };
-/* Definitions for TimerFertilizer */
-osTimerId_t TimerFertilizerHandle;
-const osTimerAttr_t TimerFertilizer_attributes = {
-  .name = "TimerFertilizer"
+/* Definitions for ScreenToggleTimer */
+osTimerId_t ScreenToggleTimerHandle;
+const osTimerAttr_t ScreenToggleTimer_attributes = {
+  .name = "ScreenToggleTimer"
 };
 /* Definitions for WorkingSemaphore */
 osSemaphoreId_t WorkingSemaphoreHandle;
@@ -98,22 +102,25 @@ const osSemaphoreAttr_t WorkingSemaphore_attributes = {
 volatile uint8_t wateringAllowed = 1;
 volatile uint8_t tankEmpty  = 0;
 volatile uint8_t lcdReady = 0;
-
+volatile uint8_t currentScreen = 0;  // 0 = water screen, 1 = light screen
 osMutexId_t lcdMutexHandle;
-
+volatile uint16_t g_lastSoilValue  = 0;
+volatile uint16_t g_lastWaterLevel = 0;
+volatile uint16_t g_lastLightValue = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_USART2_UART_Init(void);
 void StartDefaultTask(void *argument);
 void StartWatering(void *argument);
-void StartFertilizer(void *argument);
+void StartLightCtrl(void *argument);
 void Callback01(void *argument);
-void Callback02(void *argument);
+void ScreenToggleCallback(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -121,6 +128,7 @@ void Callback02(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     if (hadc->Instance == ADC1) {
         uint16_t soilValue = (uint16_t)HAL_ADC_GetValue(&hadc1);
@@ -152,6 +160,27 @@ uint16_t ReadWaterLevel(void) {
     return val;
 }
 
+uint16_t ReadLightLevel(void) {
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = ADC_CHANNEL_5;   // PA0 = IN5 on L432KC
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_24CYCLES_5;
+    sConfig.SingleDiff = ADC_SINGLE_ENDED;
+    sConfig.OffsetNumber = ADC_OFFSET_NONE;
+    sConfig.Offset = 0;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
+    uint16_t val = (uint16_t)HAL_ADC_GetValue(&hadc1);
+
+    // switch back to soil moisture channel
+    sConfig.Channel = ADC_CHANNEL_6;
+    sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+    return val;
+}
 /* USER CODE END 0 */
 
 /**
@@ -183,9 +212,10 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_USART2_UART_Init();
   MX_ADC1_Init();
   MX_I2C1_Init();
+  MX_TIM1_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -194,9 +224,7 @@ int main(void)
   osKernelInitialize();
 
   /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
-	lcdMutexHandle = osMutexNew(NULL);
-
+  lcdMutexHandle = osMutexNew(NULL);
   /* USER CODE END RTOS_MUTEX */
 
   /* Create the semaphores(s) */
@@ -211,11 +239,10 @@ int main(void)
   /* creation of Timerwater */
   TimerwaterHandle = osTimerNew(Callback01, osTimerOnce, NULL, &Timerwater_attributes);
 
-  /* creation of TimerFertilizer */
-  TimerFertilizerHandle = osTimerNew(Callback02, osTimerPeriodic, NULL, &TimerFertilizer_attributes);
+  /* creation of ScreenToggleTimer */
+  ScreenToggleTimerHandle = osTimerNew(ScreenToggleCallback, osTimerPeriodic, NULL, &ScreenToggleTimer_attributes);
 
   /* USER CODE BEGIN RTOS_TIMERS */
-  /* start timers, add new ones, ... */
   /* USER CODE END RTOS_TIMERS */
 
   /* Create the queue(s) */
@@ -233,8 +260,8 @@ int main(void)
   /* creation of Watering */
   WateringHandle = osThreadNew(StartWatering, NULL, &Watering_attributes);
 
-  /* creation of Fertilizer */
-  FertilizerHandle = osThreadNew(StartFertilizer, NULL, &Fertilizer_attributes);
+  /* creation of LightCtrl */
+  LightCtrlHandle = osThreadNew(StartLightCtrl, NULL, &LightCtrl_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -427,6 +454,76 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 99;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
+  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
+  sBreakDeadTimeConfig.Break2Filter = 0;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -470,7 +567,7 @@ static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
-
+	
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
@@ -479,17 +576,17 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_Fertilizer_Pin|GPIO_Water_Pin|GPIO_OP_Buzzer_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIO_Water_GPIO_Port, GPIO_Water_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : GPIO_Fertilizer_Pin GPIO_Water_Pin GPIO_OP_Buzzer_Pin */
-  GPIO_InitStruct.Pin = GPIO_Fertilizer_Pin|GPIO_Water_Pin|GPIO_OP_Buzzer_Pin;
+  /*Configure GPIO pin : GPIO_Water_Pin */
+  GPIO_InitStruct.Pin = GPIO_Water_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIO_Water_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LD3_Pin */
   GPIO_InitStruct.Pin = LD3_Pin;
@@ -500,7 +597,6 @@ static void MX_GPIO_Init(void)
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 	HAL_GPIO_WritePin(GPIOA, GPIO_Water_Pin, GPIO_PIN_SET);   // relay OFF at boot
-
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -528,14 +624,54 @@ void StartDefaultTask(void *argument)
   LCD_SetCursor(1, 0);
   LCD_Print("  Starting...   ");
   osMutexRelease(lcdMutexHandle);
+  osTimerStart(ScreenToggleTimerHandle, pdMS_TO_TICKS(5000));  
 
   osDelay(2000);
 
-  osMutexAcquire(lcdMutexHandle, osWaitForever);
-  LCD_Clear();
-  osMutexRelease(lcdMutexHandle);
+  uint8_t lastScreen = 255; // force clear on first render
 
-  for(;;) { osDelay(1000); }
+  for(;;)
+  {
+    if (currentScreen != lastScreen) {
+        // screen just changed � clear display
+        osMutexAcquire(lcdMutexHandle, osWaitForever);
+        LCD_Clear();
+        osMutexRelease(lcdMutexHandle);
+        lastScreen = currentScreen;
+    }
+
+    osMutexAcquire(lcdMutexHandle, osWaitForever);
+
+    if (currentScreen == 0) {
+        char line0[17], line1[17];
+        snprintf(line0, sizeof(line0), "Soil:%-5u %s",
+                 g_lastSoilValue,
+                 g_lastSoilValue > SOIL_DRY_THRESHOLD ? "DRY " : "OK  ");
+        LCD_SetCursor(0, 0);
+        LCD_Print(line0);
+        LCD_SetCursor(1, 0);
+        if (tankEmpty) {
+            LCD_Print("Tank: EMPTY     ");
+        } else if (!wateringAllowed) {
+            LCD_Print("Tank: COOLDOWN  ");
+        } else {
+            snprintf(line1, sizeof(line1), "Tank:%-5u OK   ", g_lastWaterLevel);
+            LCD_Print(line1);
+        }
+    } else {
+        char line0[17], line1[17];
+        snprintf(line0, sizeof(line0), "Lux: %-5u      ", g_lastLightValue);
+        snprintf(line1, sizeof(line1), "Strip: %s       ",
+                 g_lastLightValue < LIGHT_LOW_THRESHOLD ? "ON " : "OFF");
+        LCD_SetCursor(0, 0);
+        LCD_Print(line0);
+        LCD_SetCursor(1, 0);
+        LCD_Print(line1);
+    }
+
+    osMutexRelease(lcdMutexHandle);
+    osDelay(500); // refresh every 500ms
+  }
   /* USER CODE END 5 */
 }
 
@@ -551,114 +687,118 @@ void StartWatering(void *argument)
   /* USER CODE BEGIN StartWatering */
   while (!lcdReady) { osDelay(10); }
   osDelay(2500);
+
   uint16_t soilvalue;
   uint16_t waterLevel;
   char buffer[20];
-	char buffer1[20];
-  char lcdLine[17];
+  char buffer1[20];
+
   for(;;)
   {
     HAL_ADC_Start_IT(&hadc1);
     osMessageQueueGet(RQHandle, &soilvalue, NULL, osWaitForever);
+    g_lastSoilValue = soilvalue;
 
-    // -- LCD update protected by mutex --
-    osMutexAcquire(lcdMutexHandle, osWaitForever);
-    LCD_SetCursor(0, 0);
-    snprintf(lcdLine, sizeof(lcdLine), "Soil: %-5u RAW", soilvalue);
-    LCD_Print(lcdLine);
-    LCD_SetCursor(1, 0);
-    if (!wateringAllowed) {
-        LCD_Print("Cooldown...     ");
-    } else if (soilvalue > SOIL_DRY_THRESHOLD) {
-        LCD_Print("Status: DRY     ");
+    waterLevel = ReadWaterLevel();
+    g_lastWaterLevel = waterLevel;
+
+    int len1 = snprintf(buffer1, sizeof(buffer1), "water: %u\r\n", waterLevel);
+    HAL_UART_Transmit(&huart2, (uint8_t*)buffer1, len1, 100);
+    osDelay(1000);
+
+    if (waterLevel < WATER_EMPTY_THRESHOLD) {
+        tankEmpty = 1;
+        HAL_UART_Transmit(&huart2, (uint8_t*)"TANK EMPTY\r\n", 12, 100);
     } else {
-        LCD_Print("Status: OK      ");
+        tankEmpty = 0;
     }
-    osMutexRelease(lcdMutexHandle);
 
-		// check water level first
-		waterLevel = ReadWaterLevel();
-			int len1 = snprintf(buffer1, sizeof(buffer1), "water: %u\r\n", waterLevel);
-			HAL_UART_Transmit(&huart2, (uint8_t*)buffer1, len1, 100);
-		osDelay(1000);
-		if (waterLevel < WATER_EMPTY_THRESHOLD) {
-			tankEmpty = 1;
-			osMutexAcquire(lcdMutexHandle, osWaitForever);
-			LCD_SetCursor(1, 0);
-			LCD_Print("Tank Empty!     ");
-			osDelay(3000);
-			osMutexRelease(lcdMutexHandle);
-			HAL_UART_Transmit(&huart2, (uint8_t*)"TANK EMPTY\r\n", 12, 100);
-				
-    } else {
-        tankEmpty = 0; // clears automatically when tank is refilled
+    if (soilvalue > SOIL_DRY_THRESHOLD && wateringAllowed && !tankEmpty) {
+        if (osSemaphoreAcquire(WorkingSemaphoreHandle, 0) == osOK) {
+            wateringAllowed = 0;
+            osDelay(6000);
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+            osDelay(5000);
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+            osSemaphoreRelease(WorkingSemaphoreHandle);
+            osTimerStart(TimerwaterHandle, pdMS_TO_TICKS(10000));
+        }
+        int len = snprintf(buffer, sizeof(buffer), "Soil: %u\r\n", soilvalue);
+        HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
+        osDelay(1000);
     }
-	
-			// -- watering logic --
-			if (soilvalue > SOIL_DRY_THRESHOLD && wateringAllowed && !tankEmpty) {
-				{
-					if (osSemaphoreAcquire(WorkingSemaphoreHandle, 0) == osOK) {
-							wateringAllowed = 0;
-							osMutexAcquire(lcdMutexHandle, osWaitForever);
-							LCD_SetCursor(1, 0);
-							LCD_Print("Watering...     ");
-							osMutexRelease(lcdMutexHandle);
-							osDelay(6000); // delay before watering 
-							HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
-							osDelay(5000);
-							HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
-							osSemaphoreRelease(WorkingSemaphoreHandle);
-							osTimerStart(TimerwaterHandle, pdMS_TO_TICKS(10000)); // 5 second cooldown
-							
-					}
-				}
-
-			// -- UART debug --
-			int len = snprintf(buffer, sizeof(buffer), "Soil: %u\r\n", soilvalue);
-			HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
-			osDelay(1000);
-		}
+  }
   /* USER CODE END StartWatering */
-	}
 }
 
-/* USER CODE BEGIN Header_StartFertilizer */
+/* USER CODE BEGIN Header_StartLightCtrl */
 /**
-* @brief Function implementing the Fertilizer thread.
+* @brief Function implementing the LightCtrl thread.
 * @param argument: Not used
 * @retval None
 */
-/* USER CODE END Header_StartFertilizer */
-void StartFertilizer(void *argument)
+/* USER CODE END Header_StartLightCtrl */
+void StartLightCtrl(void *argument)
 {
-  /* USER CODE BEGIN StartFertilizer */
-  /* Infinite loop */
+  /* USER CODE BEGIN StartLightCtrl */
+  while (!lcdReady) { osDelay(10); }
+
+  uint16_t lightValue;
+  char buffer[40];
+	uint32_t duty;
+	float psc;
+	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+
   for(;;)
   {
-    osDelay(1);
+    lightValue = ReadLightLevel();
+    g_lastLightValue = lightValue;
+			psc = (320000/100) - 1 ;
+	// set a prescaler value for the intended timer
+	  __HAL_TIM_SET_PRESCALER(&htim1,psc);
+		
+		char dbg[30];
+		int dlen = snprintf(dbg, sizeof(dbg), "LightRaw: %u\r\n", lightValue);
+		HAL_UART_Transmit(&huart2, (uint8_t*)dbg, dlen, 100);
+
+    if (lightValue < LIGHT_LOW_THRESHOLD) {
+			  duty = (uint32_t)(99.0f * (1.0f - (lightValue / 5000.0f)));
+        if (duty > 99) duty = 99;
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty);
+			int len = snprintf(buffer, sizeof(buffer), "duty: %u\r\n", duty);
+    HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
+       
+    } else {
+         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+    }
+
+    int len = snprintf(buffer, sizeof(buffer), "Light: %u\r\n", lightValue);
+    HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
+
+    osDelay(500);
   }
-  /* USER CODE END StartFertilizer */
+  /* USER CODE END StartLightCtrl */
 }
 
 /* Callback01 function */
 void Callback01(void *argument)
 {
   /* USER CODE BEGIN Callback01 */
-		wateringAllowed = 1;
+  wateringAllowed = 1;
   /* USER CODE END Callback01 */
 }
 
-/* Callback02 function */
-void Callback02(void *argument)
+/* ScreenToggleCallback function */
+void ScreenToggleCallback(void *argument)
 {
-  /* USER CODE BEGIN Callback02 */
-
-  /* USER CODE END Callback02 */
+  /* USER CODE BEGIN ScreenToggleCallback */
+	currentScreen = (currentScreen == 0) ? 1 : 0;
+  /* USER CODE END ScreenToggleCallback */
 }
 
 /**
   * @brief  Period elapsed callback in non blocking mode
-  * @note   This function is called  when TIM1 interrupt took place, inside
+  * @note   This function is called  when TIM6 interrupt took place, inside
   * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
   * a global variable "uwTick" used as application time base.
   * @param  htim : TIM handle
@@ -669,7 +809,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   /* USER CODE BEGIN Callback 0 */
 
   /* USER CODE END Callback 0 */
-  if (htim->Instance == TIM1)
+  if (htim->Instance == TIM6)
   {
     HAL_IncTick();
   }
