@@ -26,15 +26,8 @@
 #include "lcd_i2c.h"
 #include "queue.h"
 #include "string.h"
-#define SOIL_DRY_THRESHOLD 2500
 #define Hours_toWater 6
-#define WATER_EMPTY_THRESHOLD 750
-#define LIGHT_LOW_THRESHOLD   3500
 #define LIGHT_CHECK_INTERVAL  5000
-#define TEMP_COOL_MAX  24
-#define TEMP_WARM_MAX  34
-#define HUMID_FAN_LOW   50
-#define HUMID_FAN_HIGH  70
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -100,11 +93,6 @@ osTimerId_t TimerwaterHandle;
 const osTimerAttr_t Timerwater_attributes = {
   .name = "Timerwater"
 };
-/* Definitions for ScreenToggleTimer */
-osTimerId_t ScreenToggleTimerHandle;
-const osTimerAttr_t ScreenToggleTimer_attributes = {
-  .name = "ScreenToggleTimer"
-};
 /* Definitions for WorkingSemaphore */
 osSemaphoreId_t WorkingSemaphoreHandle;
 const osSemaphoreAttr_t WorkingSemaphore_attributes = {
@@ -121,6 +109,26 @@ volatile uint16_t g_lastWaterLevel = 0;
 volatile uint16_t g_lastLightValue = 0;
 volatile int16_t g_lastTemperature = 0;
 volatile int16_t g_lastHumidity = 0;
+volatile uint8_t uart_rx_byte = 0;
+
+// Runtime-adjustable thresholds
+volatile uint16_t SOIL_DRY_THRESHOLD = 2500;
+volatile uint16_t WATER_EMPTY_THRESHOLD = 750;
+volatile uint16_t LIGHT_LOW_THRESHOLD = 3500;
+volatile uint16_t TEMP_COOL_MAX = 24;
+volatile uint16_t TEMP_WARM_MAX = 34;
+volatile uint16_t HUMID_FAN_LOW = 50;
+volatile uint16_t HUMID_FAN_HIGH = 70;
+
+// Settings edit state
+volatile uint8_t g_settingsLevel = 0;     // 0 = subsystem pick, 1 = threshold pick
+volatile uint8_t g_settingsSubsystem = 0; // 1=Watering, 2=Light, 3=Climate
+volatile uint8_t g_editMode = 0;
+volatile uint8_t g_editItem = 0;
+char g_inputBuf[6];
+uint8_t g_inputIdx = 0;
+volatile uint8_t g_prevScreen = 0;
+volatile uint8_t g_confirmReset = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -136,7 +144,6 @@ void StartWatering(void *argument);
 void StartLightCtrl(void *argument);
 void StartClimateCtrl(void *argument);
 void Callback01(void *argument);
-void ScreenToggleCallback(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -144,6 +151,15 @@ void ScreenToggleCallback(void *argument);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static const char *settingNames[7] = {
+    "SoilDry", "WtrLvl", "Light", "HumLow", "HumHi", "TmpCl", "TmpWr"
+};
+
+static volatile uint16_t * const thresholdPtrs[7] = {
+    &SOIL_DRY_THRESHOLD, &WATER_EMPTY_THRESHOLD, &LIGHT_LOW_THRESHOLD,
+    &HUMID_FAN_LOW, &HUMID_FAN_HIGH, &TEMP_COOL_MAX, &TEMP_WARM_MAX
+};
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     if (hadc->Instance == ADC1) {
@@ -338,9 +354,6 @@ int main(void)
   /* Create the timer(s) */
   /* creation of Timerwater */
   TimerwaterHandle = osTimerNew(Callback01, osTimerOnce, NULL, &Timerwater_attributes);
-
-  /* creation of ScreenToggleTimer */
-  ScreenToggleTimerHandle = osTimerNew(ScreenToggleCallback, osTimerPeriodic, NULL, &ScreenToggleTimer_attributes);
 
   /* USER CODE BEGIN RTOS_TIMERS */
   /* USER CODE END RTOS_TIMERS */
@@ -762,6 +775,153 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+static void uart_msg(const char *msg) {
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+}
+
+static void print_screen_name(void) {
+    switch (currentScreen) {
+        case 0: uart_msg("Water Subsystem\r\n"); break;
+        case 1: uart_msg("Light Subsystem\r\n"); break;
+        case 2: uart_msg("Climate Subsystem\r\n"); break;
+        case 3: uart_msg("Settings\r\n"); break;
+    }
+}
+
+static void settings_commit(void) {
+    g_inputBuf[g_inputIdx] = '\0';
+    uint16_t val = 0;
+    for (uint8_t i = 0; i < g_inputIdx; i++)
+        val = val * 10 + (g_inputBuf[i] - '0');
+    if (val > 100) val = 100;
+    uint16_t raw = val;
+    switch (g_editItem) {
+        case 1:
+            raw = (uint16_t)((100u - val) * 4095u / 100u);
+            SOIL_DRY_THRESHOLD = raw; break;
+        case 2:
+        case 3:
+            raw = (uint16_t)(val * 4095u / 100u);
+            if (g_editItem == 2) WATER_EMPTY_THRESHOLD = raw;
+            else LIGHT_LOW_THRESHOLD = raw;
+            break;
+        case 4: HUMID_FAN_LOW = val; break;
+        case 5: HUMID_FAN_HIGH = val; break;
+        case 6: TEMP_COOL_MAX = val; break;
+        case 7: TEMP_WARM_MAX = val; break;
+    }
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%s set to %u\r\n", settingNames[g_editItem - 1], val);
+    HAL_UART_Transmit(&huart2, (uint8_t*)buf, len, 100);
+    g_editMode = 0;
+    g_editItem = 0;
+    g_settingsLevel = 0;
+    g_settingsSubsystem = 0;
+}
+
+static void settings_reset_defaults(void) {
+    SOIL_DRY_THRESHOLD = 2500;
+    WATER_EMPTY_THRESHOLD = 750;
+    LIGHT_LOW_THRESHOLD = 3500;
+    TEMP_COOL_MAX = 24;
+    TEMP_WARM_MAX = 34;
+    HUMID_FAN_LOW = 50;
+    HUMID_FAN_HIGH = 70;
+    uart_msg("Defaults restored\r\n");
+}
+
+static void settings_start_edit(uint8_t item) {
+    g_editItem = item;
+    g_editMode = 1;
+    g_inputIdx = 0;
+    g_inputBuf[0] = '\0';
+    uint16_t cur = *thresholdPtrs[item - 1];
+    char buf[32];
+    if (item <= 3) {
+        uint16_t pct = (item == 1)
+            ? 100 - (cur * 100 / 4095)
+            : (cur * 100 / 4095);
+        int len = snprintf(buf, sizeof(buf), "%s: %u%%\r\n", settingNames[item - 1], pct);
+        HAL_UART_Transmit(&huart2, (uint8_t*)buf, len, 100);
+    } else {
+        int len = snprintf(buf, sizeof(buf), "%s: %u\r\n", settingNames[item - 1], cur);
+        HAL_UART_Transmit(&huart2, (uint8_t*)buf, len, 100);
+    }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART2) {
+        if (currentScreen == 3 && g_editMode) {
+            if (uart_rx_byte >= '0' && uart_rx_byte <= '9') {
+                if (g_inputIdx < 5) {
+                    g_inputBuf[g_inputIdx++] = uart_rx_byte;
+                }
+            } else if (uart_rx_byte == '\b' || uart_rx_byte == 0x7F) {
+                if (g_inputIdx > 0) g_inputIdx--;
+            } else if (uart_rx_byte == '\r' || uart_rx_byte == '\n') {
+                if (g_inputIdx > 0) settings_commit();
+            } else if (uart_rx_byte == 0x1B) {
+                uart_msg("Cancelled\r\n");
+                g_editMode = 0;
+                g_editItem = 0;
+                g_settingsLevel = 0;
+                g_settingsSubsystem = 0;
+            }
+        } else if (currentScreen == 3 && !g_editMode) {
+            if (g_confirmReset) {
+                if (uart_rx_byte == 'y' || uart_rx_byte == 'Y') {
+                    settings_reset_defaults();
+                    g_confirmReset = 0;
+                } else {
+                    uart_msg("Reset cancelled\r\n");
+                    g_confirmReset = 0;
+                }
+            } else if (g_settingsLevel == 0) {
+                if (uart_rx_byte == '1') {
+                    g_settingsSubsystem = 1;
+                    g_settingsLevel = 1;
+                } else if (uart_rx_byte == '2') {
+                    settings_start_edit(3);
+                } else if (uart_rx_byte == '3') {
+                    g_settingsSubsystem = 3;
+                    g_settingsLevel = 1;
+                } else if (uart_rx_byte == '4') {
+                    g_confirmReset = 1;
+                } else if (uart_rx_byte == 's' || uart_rx_byte == 'S'
+                        || uart_rx_byte == 0x1B) {
+                    uart_msg("Exiting Settings\r\n");
+                    currentScreen = g_prevScreen;
+                }
+            } else if (g_settingsLevel == 1) {
+                if (g_settingsSubsystem == 1) {
+                    if (uart_rx_byte == '1') settings_start_edit(1);
+                    else if (uart_rx_byte == '2') settings_start_edit(2);
+                } else if (g_settingsSubsystem == 3) {
+                    if (uart_rx_byte >= '1' && uart_rx_byte <= '4')
+                        settings_start_edit(uart_rx_byte - '0' + 3);
+                }
+                if (uart_rx_byte == 's' || uart_rx_byte == 'S'
+                        || uart_rx_byte == 0x1B || uart_rx_byte == '\b') {
+                    g_settingsLevel = 0;
+                    g_settingsSubsystem = 0;
+                }
+            }
+        } else {
+            uint8_t prevScreen = currentScreen;
+            if (uart_rx_byte == 'd' || uart_rx_byte == 'D')
+                currentScreen = (currentScreen >= 2) ? 0 : (currentScreen + 1);
+            else if (uart_rx_byte == 'a' || uart_rx_byte == 'A')
+                currentScreen = (currentScreen == 0) ? 2 : (currentScreen - 1);
+            else if (uart_rx_byte == 's' || uart_rx_byte == 'S') {
+                g_prevScreen = currentScreen;
+                currentScreen = 3;
+            }
+            if (currentScreen != prevScreen) print_screen_name();
+        }
+        HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+    }
+}
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -784,8 +944,8 @@ void StartDefaultTask(void *argument)
   LCD_SetCursor(1, 0);
   LCD_Print("  Starting...   ");
   osMutexRelease(lcdMutexHandle);
-  osTimerStart(ScreenToggleTimerHandle, pdMS_TO_TICKS(5000));  
-
+  HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);  
+  
   osDelay(2000);
 
   uint8_t lastScreen = 255; // force clear on first render
@@ -804,30 +964,33 @@ void StartDefaultTask(void *argument)
 
     if (currentScreen == 0) {
         char line0[17], line1[17];
-        snprintf(line0, sizeof(line0), "Soil:%-5u %s",
-                 g_lastSoilValue,
-                 g_lastSoilValue > SOIL_DRY_THRESHOLD ? "DRY " : "OK  ");
+        uint16_t soilPct = 100 - (g_lastSoilValue * 100 / 4095);
+        snprintf(line0, sizeof(line0), "Soil:%3u%% %s",
+                 soilPct,
+                 g_lastSoilValue > SOIL_DRY_THRESHOLD ? "DRY" : "OK ");
         LCD_SetCursor(0, 0);
         LCD_Print(line0);
         LCD_SetCursor(1, 0);
+        uint16_t tankPct = g_lastWaterLevel * 100 / 4095;
         if (tankEmpty) {
-            LCD_Print("Tank: EMPTY     ");
+            snprintf(line1, sizeof(line1), "Tank:%3u%% EMPTY", tankPct);
         } else if (!wateringAllowed) {
-            LCD_Print("Tank: COOLDOWN  ");
+            snprintf(line1, sizeof(line1), "Tank:%3u%% COOLD", tankPct);
         } else {
-            snprintf(line1, sizeof(line1), "Tank:%-5u OK   ", g_lastWaterLevel);
-            LCD_Print(line1);
+            snprintf(line1, sizeof(line1), "Tank:%3u%% OK   ", tankPct);
         }
+        LCD_Print(line1);
     } else if (currentScreen == 1) {
         char line0[17], line1[17];
-        snprintf(line0, sizeof(line0), "Lux: %-5u      ", g_lastLightValue);
+        uint16_t lightPct = g_lastLightValue * 100 / 4095;
+        snprintf(line0, sizeof(line0), "Light:%3u%%      ", lightPct);
         snprintf(line1, sizeof(line1), "Strip: %s       ",
                  g_lastLightValue < LIGHT_LOW_THRESHOLD ? "ON " : "OFF");
         LCD_SetCursor(0, 0);
         LCD_Print(line0);
         LCD_SetCursor(1, 0);
         LCD_Print(line1);
-    } else {
+    } else if (currentScreen == 2) {
         char line0[17], line1[17];
         const char *fan;
         if (g_lastHumidity <= HUMID_FAN_LOW)
@@ -838,6 +1001,42 @@ void StartDefaultTask(void *argument)
             fan = "100%";
         snprintf(line0, sizeof(line0), "Temp:%dC          ", g_lastTemperature);
         snprintf(line1, sizeof(line1), "Hum:%d%% F:%-4s ", g_lastHumidity, fan);
+        LCD_SetCursor(0, 0);
+        LCD_Print(line0);
+        LCD_SetCursor(1, 0);
+        LCD_Print(line1);
+    } else if (currentScreen == 3) {
+        char line0[17], line1[17];
+        if (g_confirmReset) {
+            snprintf(line0, sizeof(line0), "%-16s", "Rst defaults?");
+            snprintf(line1, sizeof(line1), "%-16s", "Y / N");
+        } else if (g_editMode) {
+            uint16_t cur = *thresholdPtrs[g_editItem - 1];
+            char tmp[17];
+            if (g_editItem <= 3) {
+                uint16_t pct = (g_editItem == 1)
+                    ? 100 - (cur * 100 / 4095)
+                    : (cur * 100 / 4095);
+                snprintf(tmp, sizeof(tmp), "%s:%u%%", settingNames[g_editItem - 1], pct);
+            } else {
+                snprintf(tmp, sizeof(tmp), "%s:%u", settingNames[g_editItem - 1], cur);
+            }
+            snprintf(line0, sizeof(line0), "%-16s", tmp);
+            g_inputBuf[g_inputIdx] = '\0';
+            snprintf(tmp, sizeof(tmp), "%s>_", g_inputIdx == 0 ? "" : g_inputBuf);
+            snprintf(line1, sizeof(line1), "%-16s", tmp);
+        } else if (g_settingsLevel == 0) {
+            snprintf(line0, sizeof(line0), "%-16s", "1-Water 2-Light");
+            snprintf(line1, sizeof(line1), "%-16s", "3-Climate 4-RST");
+        } else if (g_settingsLevel == 1) {
+            if (g_settingsSubsystem == 1) {
+                snprintf(line0, sizeof(line0), "%-16s", "1-SoilDry");
+                snprintf(line1, sizeof(line1), "%-16s", "2-WtrLvl");
+            } else if (g_settingsSubsystem == 3) {
+                snprintf(line0, sizeof(line0), "%-16s", "1-HumLw 2-HumHi");
+                snprintf(line1, sizeof(line1), "%-16s", "3-TmpCl 4-TmpWr");
+            }
+        }
         LCD_SetCursor(0, 0);
         LCD_Print(line0);
         LCD_SetCursor(1, 0);
@@ -878,12 +1077,12 @@ void StartWatering(void *argument)
     g_lastWaterLevel = waterLevel;
 
     int len1 = snprintf(buffer1, sizeof(buffer1), "water: %u\r\n", waterLevel);
-    HAL_UART_Transmit(&huart2, (uint8_t*)buffer1, len1, 100);
+    /* Debug Statement */ //HAL_UART_Transmit(&huart2, (uint8_t*)buffer1, len1, 100);
     osDelay(1000);
 
     if (waterLevel < WATER_EMPTY_THRESHOLD) {
         tankEmpty = 1;
-        HAL_UART_Transmit(&huart2, (uint8_t*)"TANK EMPTY\r\n", 12, 100);
+        /* Debug Statement */ //HAL_UART_Transmit(&huart2, (uint8_t*)"TANK EMPTY\r\n", 12, 100);
     } else {
         tankEmpty = 0;
     }
@@ -899,7 +1098,7 @@ void StartWatering(void *argument)
             osTimerStart(TimerwaterHandle, pdMS_TO_TICKS(10000));
         }
         int len = snprintf(buffer, sizeof(buffer), "Soil: %u\r\n", soilvalue);
-        HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
+        /* Debug Statement */ //HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
         osDelay(1000);
     }
   }
@@ -934,21 +1133,21 @@ void StartLightCtrl(void *argument)
 		
 		char dbg[30];
 		int dlen = snprintf(dbg, sizeof(dbg), "LightRaw: %u\r\n", lightValue);
-		HAL_UART_Transmit(&huart2, (uint8_t*)dbg, dlen, 100);
+		/* Debug Statement */ //HAL_UART_Transmit(&huart2, (uint8_t*)dbg, dlen, 100);
 
     if (lightValue < LIGHT_LOW_THRESHOLD) {
 			  duty = (uint32_t)(99.0f * (1.0f - (lightValue / 5000.0f)));
         if (duty > 99) duty = 99;
         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty);
 			int len = snprintf(buffer, sizeof(buffer), "duty: %u\r\n", duty);
-    HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
+    /* Debug Statement */ //HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
        
     } else {
          __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
     }
 
     int len = snprintf(buffer, sizeof(buffer), "Light: %u\r\n", lightValue);
-    HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
+    /* Debug Statement */ //HAL_UART_Transmit(&huart2, (uint8_t*)buffer, len, 100);
 
     osDelay(500);
   }
@@ -981,20 +1180,20 @@ void StartClimateCtrl(void *argument)
         g_lastTemperature = temperature;
         g_lastHumidity = humidity;
         int len = snprintf(buf, sizeof(buf), "Temp:%dC Hum:%d%%\r\n", temperature, humidity);
-        HAL_UART_Transmit(&huart2, (uint8_t*)buf, len, 100);
+        /* Debug Statement */ //HAL_UART_Transmit(&huart2, (uint8_t*)buf, len, 100);
 
         if (humidity <= HUMID_FAN_LOW) {
             __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
-            HAL_UART_Transmit(&huart2, (uint8_t*)"Fan: OFF\r\n", 10, 100);
+            /* Debug Statement */ //HAL_UART_Transmit(&huart2, (uint8_t*)"Fan: OFF\r\n", 10, 100);
         } else if (humidity <= HUMID_FAN_HIGH) {
             __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 49);
-            HAL_UART_Transmit(&huart2, (uint8_t*)"Fan: 50%\r\n", 10, 100);
+            /* Debug Statement */ //HAL_UART_Transmit(&huart2, (uint8_t*)"Fan: 50%\r\n", 10, 100);
         } else {
             __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 99);
-            HAL_UART_Transmit(&huart2, (uint8_t*)"Fan: 100%\r\n", 11, 100);
+            /* Debug Statement */ //HAL_UART_Transmit(&huart2, (uint8_t*)"Fan: 100%\r\n", 11, 100);
         }
     } else {
-        HAL_UART_Transmit(&huart2, (uint8_t*)"DHT11 FAIL\r\n", 12, 100);
+        /* Debug Statement */ //HAL_UART_Transmit(&huart2, (uint8_t*)"DHT11 FAIL\r\n", 12, 100);
     }
     osDelay(4000);
   }
@@ -1007,14 +1206,6 @@ void Callback01(void *argument)
   /* USER CODE BEGIN Callback01 */
   wateringAllowed = 1;
   /* USER CODE END Callback01 */
-}
-
-/* ScreenToggleCallback function */
-void ScreenToggleCallback(void *argument)
-{
-  /* USER CODE BEGIN ScreenToggleCallback */
-	currentScreen = (currentScreen >= 2) ? 0 : (currentScreen + 1);
-  /* USER CODE END ScreenToggleCallback */
 }
 
 /**
