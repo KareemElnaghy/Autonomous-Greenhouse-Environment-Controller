@@ -73,6 +73,8 @@ void Error_Handler(void);
 #define GPIO_DHT_GPIO_Port GPIOB
 #define TIM1_PWM_Light_Pin GPIO_PIN_8
 #define TIM1_PWM_Light_GPIO_Port GPIOA
+#define TIM1_PWM_Fan_Pin GPIO_PIN_10
+#define TIM1_PWM_Fan_GPIO_Port GPIOA
 #define SWDIO_Pin GPIO_PIN_13
 #define SWDIO_GPIO_Port GPIOA
 #define SWCLK_Pin GPIO_PIN_14
