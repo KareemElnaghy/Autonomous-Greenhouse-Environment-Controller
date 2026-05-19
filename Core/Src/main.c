@@ -19,13 +19,11 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
-
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-#include "stdio.h"
 #include "lcd_i2c.h"
+#include "keypad.h"
 #include "queue.h"
 #include "string.h"
+#include <stdio.h>
 #define Hours_toWater 6
 #define LIGHT_CHECK_INTERVAL  5000
 /* USER CODE END Includes */
@@ -849,76 +847,78 @@ static void settings_start_edit(uint8_t item) {
     }
 }
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    if (huart->Instance == USART2) {
-        if (currentScreen == 3 && g_editMode) {
-            if (uart_rx_byte >= '0' && uart_rx_byte <= '9') {
-                if (g_inputIdx < 5) {
-                    g_inputBuf[g_inputIdx++] = uart_rx_byte;
-                }
-            } else if (uart_rx_byte == '\b' || uart_rx_byte == 0x7F) {
-                if (g_inputIdx > 0) g_inputIdx--;
-            } else if (uart_rx_byte == '\r' || uart_rx_byte == '\n') {
-                if (g_inputIdx > 0) settings_commit();
-            } else if (uart_rx_byte == 0x1B) {
-                uart_msg("Cancelled\r\n");
-                g_editMode = 0;
-                g_editItem = 0;
+static void handle_keypress(uint8_t key) {
+    if (currentScreen == 3 && g_editMode) {
+        if (key >= '0' && key <= '9') {
+            if (g_inputIdx < 5) {
+                g_inputBuf[g_inputIdx++] = key;
+            }
+        } else if (key == '\b' || key == 0x7F) {
+            if (g_inputIdx > 0) g_inputIdx--;
+        } else if (key == '\r' || key == '\n') {
+            if (g_inputIdx > 0) settings_commit();
+        } else if (key == 0x1B) {
+            uart_msg("Cancelled\r\n");
+            g_editMode = 0;
+            g_editItem = 0;
+            g_settingsLevel = 0;
+            g_settingsSubsystem = 0;
+        }
+    } else if (currentScreen == 3 && !g_editMode) {
+        if (g_confirmReset) {
+            if (key == 'y' || key == 'Y' || key == '\r' || key == '\n') {
+                settings_reset_defaults();
+                g_confirmReset = 0;
+            } else if (key == 0x1B) {
+                uart_msg("Reset cancelled\r\n");
+                g_confirmReset = 0;
+            }
+        } else if (g_settingsLevel == 0) {
+            if (key == '1') {
+                g_settingsSubsystem = 1;
+                g_settingsLevel = 1;
+            } else if (key == '2') {
+                settings_start_edit(3);
+            } else if (key == '3') {
+                g_settingsSubsystem = 3;
+                g_settingsLevel = 1;
+            } else if (key == '4') {
+                g_confirmReset = 1;
+            } else if (key == 's' || key == 'S' || key == 0x1B) {
+                uart_msg("Exiting Settings\r\n");
+                currentScreen = g_prevScreen;
+            }
+        } else if (g_settingsLevel == 1) {
+            if (g_settingsSubsystem == 1) {
+                if (key == '1') settings_start_edit(1);
+                else if (key == '2') settings_start_edit(2);
+            } else if (g_settingsSubsystem == 3) {
+                if (key >= '1' && key <= '4')
+                    settings_start_edit(key - '0' + 3);
+            }
+            if (key == 's' || key == 'S' || key == 0x1B || key == '\b') {
                 g_settingsLevel = 0;
                 g_settingsSubsystem = 0;
             }
-        } else if (currentScreen == 3 && !g_editMode) {
-            if (g_confirmReset) {
-                if (uart_rx_byte == 'y' || uart_rx_byte == 'Y') {
-                    settings_reset_defaults();
-                    g_confirmReset = 0;
-                } else {
-                    uart_msg("Reset cancelled\r\n");
-                    g_confirmReset = 0;
-                }
-            } else if (g_settingsLevel == 0) {
-                if (uart_rx_byte == '1') {
-                    g_settingsSubsystem = 1;
-                    g_settingsLevel = 1;
-                } else if (uart_rx_byte == '2') {
-                    settings_start_edit(3);
-                } else if (uart_rx_byte == '3') {
-                    g_settingsSubsystem = 3;
-                    g_settingsLevel = 1;
-                } else if (uart_rx_byte == '4') {
-                    g_confirmReset = 1;
-                } else if (uart_rx_byte == 's' || uart_rx_byte == 'S'
-                        || uart_rx_byte == 0x1B) {
-                    uart_msg("Exiting Settings\r\n");
-                    currentScreen = g_prevScreen;
-                }
-            } else if (g_settingsLevel == 1) {
-                if (g_settingsSubsystem == 1) {
-                    if (uart_rx_byte == '1') settings_start_edit(1);
-                    else if (uart_rx_byte == '2') settings_start_edit(2);
-                } else if (g_settingsSubsystem == 3) {
-                    if (uart_rx_byte >= '1' && uart_rx_byte <= '4')
-                        settings_start_edit(uart_rx_byte - '0' + 3);
-                }
-                if (uart_rx_byte == 's' || uart_rx_byte == 'S'
-                        || uart_rx_byte == 0x1B || uart_rx_byte == '\b') {
-                    g_settingsLevel = 0;
-                    g_settingsSubsystem = 0;
-                }
-            }
-        } else {
-            uint8_t prevScreen = currentScreen;
-            if (uart_rx_byte == 'd' || uart_rx_byte == 'D')
-                currentScreen = (currentScreen >= 2) ? 0 : (currentScreen + 1);
-            else if (uart_rx_byte == 'a' || uart_rx_byte == 'A')
-                currentScreen = (currentScreen == 0) ? 2 : (currentScreen - 1);
-            else if (uart_rx_byte == 's' || uart_rx_byte == 'S') {
-                g_prevScreen = currentScreen;
-                currentScreen = 3;
-            }
-            if (currentScreen != prevScreen) print_screen_name();
         }
-        HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+    } else {
+        uint8_t prevScreen = currentScreen;
+        if (key == 'd' || key == 'D')
+            currentScreen = (currentScreen >= 2) ? 0 : (currentScreen + 1);
+        else if (key == 'a' || key == 'A')
+            currentScreen = (currentScreen == 0) ? 2 : (currentScreen - 1);
+        else if (key == 's' || key == 'S') {
+            g_prevScreen = currentScreen;
+            currentScreen = 3;
+        }
+        if (currentScreen != prevScreen) print_screen_name();
+    }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART2) {
+        handle_keypress(uart_rx_byte);
+        HAL_UART_Receive_IT(&huart2, (uint8_t*)&uart_rx_byte, 1);
     }
 }
 
@@ -938,113 +938,136 @@ void StartDefaultTask(void *argument)
   LCD_Init(&hi2c1);
   lcdReady = 1;
 
+  if (keypad_init(&hi2c1) == 0)
+      uart_msg("Keypad OK\r\n");
+  else
+      uart_msg("No keypad\r\n");
+
   osMutexAcquire(lcdMutexHandle, osWaitForever);
   LCD_SetCursor(0, 0);
   LCD_Print("  Greenhouse    ");
   LCD_SetCursor(1, 0);
   LCD_Print("  Starting...   ");
   osMutexRelease(lcdMutexHandle);
-  HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);  
+  HAL_UART_Receive_IT(&huart2, (uint8_t*)&uart_rx_byte, 1);  
   
   osDelay(2000);
 
-  uint8_t lastScreen = 255; // force clear on first render
+  uint8_t lastScreen = 255;
+  uint32_t lastLcdTick = 0;
 
   for(;;)
   {
     if (currentScreen != lastScreen) {
-        // screen just changed � clear display
         osMutexAcquire(lcdMutexHandle, osWaitForever);
         LCD_Clear();
         osMutexRelease(lcdMutexHandle);
         lastScreen = currentScreen;
+        lastLcdTick = 0;
     }
 
-    osMutexAcquire(lcdMutexHandle, osWaitForever);
+    if (HAL_GetTick() - lastLcdTick >= 500) {
+        osMutexAcquire(lcdMutexHandle, osWaitForever);
 
-    if (currentScreen == 0) {
-        char line0[17], line1[17];
-        uint16_t soilPct = 100 - (g_lastSoilValue * 100 / 4095);
-        snprintf(line0, sizeof(line0), "Soil:%3u%% %s",
-                 soilPct,
-                 g_lastSoilValue > SOIL_DRY_THRESHOLD ? "DRY" : "OK ");
-        LCD_SetCursor(0, 0);
-        LCD_Print(line0);
-        LCD_SetCursor(1, 0);
-        uint16_t tankPct = g_lastWaterLevel * 100 / 4095;
-        if (tankEmpty) {
-            snprintf(line1, sizeof(line1), "Tank:%3u%% EMPTY", tankPct);
-        } else if (!wateringAllowed) {
-            snprintf(line1, sizeof(line1), "Tank:%3u%% COOLD", tankPct);
-        } else {
-            snprintf(line1, sizeof(line1), "Tank:%3u%% OK   ", tankPct);
-        }
-        LCD_Print(line1);
-    } else if (currentScreen == 1) {
-        char line0[17], line1[17];
-        uint16_t lightPct = g_lastLightValue * 100 / 4095;
-        snprintf(line0, sizeof(line0), "Light:%3u%%      ", lightPct);
-        snprintf(line1, sizeof(line1), "Strip: %s       ",
-                 g_lastLightValue < LIGHT_LOW_THRESHOLD ? "ON " : "OFF");
-        LCD_SetCursor(0, 0);
-        LCD_Print(line0);
-        LCD_SetCursor(1, 0);
-        LCD_Print(line1);
-    } else if (currentScreen == 2) {
-        char line0[17], line1[17];
-        const char *fan;
-        if (g_lastHumidity <= HUMID_FAN_LOW)
-            fan = "OFF";
-        else if (g_lastHumidity <= HUMID_FAN_HIGH)
-            fan = "50%";
-        else
-            fan = "100%";
-        snprintf(line0, sizeof(line0), "Temp:%dC          ", g_lastTemperature);
-        snprintf(line1, sizeof(line1), "Hum:%d%% F:%-4s ", g_lastHumidity, fan);
-        LCD_SetCursor(0, 0);
-        LCD_Print(line0);
-        LCD_SetCursor(1, 0);
-        LCD_Print(line1);
+        if (currentScreen == 0) {
+            char line0[17], line1[17];
+            uint16_t soilPct = 100 - (g_lastSoilValue * 100 / 4095);
+            snprintf(line0, sizeof(line0), "Soil:%3u%% %s",
+                     soilPct,
+                     g_lastSoilValue > SOIL_DRY_THRESHOLD ? "DRY" : "OK ");
+            LCD_SetCursor(0, 0);
+            LCD_Print(line0);
+            LCD_SetCursor(1, 0);
+            uint16_t tankPct = g_lastWaterLevel * 100 / 4095;
+            if (tankEmpty) {
+                snprintf(line1, sizeof(line1), "Tank:%3u%% EMPTY", tankPct);
+            } else if (!wateringAllowed) {
+                snprintf(line1, sizeof(line1), "Tank:%3u%% COOLD", tankPct);
+            } else {
+                snprintf(line1, sizeof(line1), "Tank:%3u%% OK   ", tankPct);
+            }
+            LCD_Print(line1);
+        } else if (currentScreen == 1) {
+            char line0[17], line1[17];
+            uint16_t lightPct = g_lastLightValue * 100 / 4095;
+            snprintf(line0, sizeof(line0), "Light:%3u%%      ", lightPct);
+            snprintf(line1, sizeof(line1), "Strip: %s       ",
+                     g_lastLightValue < LIGHT_LOW_THRESHOLD ? "ON " : "OFF");
+            LCD_SetCursor(0, 0);
+            LCD_Print(line0);
+            LCD_SetCursor(1, 0);
+            LCD_Print(line1);
+        } else if (currentScreen == 2) {
+            char line0[17], line1[17];
+            const char *fan;
+            if (g_lastHumidity <= HUMID_FAN_LOW)
+                fan = "OFF";
+            else if (g_lastHumidity <= HUMID_FAN_HIGH)
+                fan = "50%";
+            else
+                fan = "100%";
+            snprintf(line0, sizeof(line0), "Temp:%dC          ", g_lastTemperature);
+            snprintf(line1, sizeof(line1), "Hum:%d%% F:%-4s ", g_lastHumidity, fan);
+            LCD_SetCursor(0, 0);
+            LCD_Print(line0);
+            LCD_SetCursor(1, 0);
+            LCD_Print(line1);
     } else if (currentScreen == 3) {
         char line0[17], line1[17];
         if (g_confirmReset) {
             snprintf(line0, sizeof(line0), "%-16s", "Rst defaults?");
-            snprintf(line1, sizeof(line1), "%-16s", "Y / N");
-        } else if (g_editMode) {
-            uint16_t cur = *thresholdPtrs[g_editItem - 1];
-            char tmp[17];
-            if (g_editItem <= 3) {
-                uint16_t pct = (g_editItem == 1)
-                    ? 100 - (cur * 100 / 4095)
-                    : (cur * 100 / 4095);
-                snprintf(tmp, sizeof(tmp), "%s:%u%%", settingNames[g_editItem - 1], pct);
-            } else {
-                snprintf(tmp, sizeof(tmp), "%s:%u", settingNames[g_editItem - 1], cur);
+            snprintf(line1, sizeof(line1), "%-16s", "E-Yes F-No");
+            } else if (g_editMode) {
+                uint16_t cur = *thresholdPtrs[g_editItem - 1];
+                char tmp[17];
+                if (g_editItem <= 3) {
+                    uint16_t pct = (g_editItem == 1)
+                        ? 100 - (cur * 100 / 4095)
+                        : (cur * 100 / 4095);
+                    snprintf(tmp, sizeof(tmp), "%s:%u%%", settingNames[g_editItem - 1], pct);
+                } else {
+                    snprintf(tmp, sizeof(tmp), "%s:%u", settingNames[g_editItem - 1], cur);
+                }
+                snprintf(line0, sizeof(line0), "%-16s", tmp);
+                g_inputBuf[g_inputIdx] = '\0';
+                snprintf(tmp, sizeof(tmp), "%s>_", g_inputIdx == 0 ? "" : g_inputBuf);
+                snprintf(line1, sizeof(line1), "%-16s", tmp);
+            } else if (g_settingsLevel == 0) {
+                snprintf(line0, sizeof(line0), "%-16s", "1-Water 2-Light");
+                snprintf(line1, sizeof(line1), "%-16s", "3-Climate 4-RST");
+            } else if (g_settingsLevel == 1) {
+                if (g_settingsSubsystem == 1) {
+                    snprintf(line0, sizeof(line0), "%-16s", "1-SoilDry");
+                    snprintf(line1, sizeof(line1), "%-16s", "2-WtrLvl");
+                } else if (g_settingsSubsystem == 3) {
+                    snprintf(line0, sizeof(line0), "%-16s", "1-HumLw 2-HumHi");
+                    snprintf(line1, sizeof(line1), "%-16s", "3-TmpCl 4-TmpWr");
+                }
             }
-            snprintf(line0, sizeof(line0), "%-16s", tmp);
-            g_inputBuf[g_inputIdx] = '\0';
-            snprintf(tmp, sizeof(tmp), "%s>_", g_inputIdx == 0 ? "" : g_inputBuf);
-            snprintf(line1, sizeof(line1), "%-16s", tmp);
-        } else if (g_settingsLevel == 0) {
-            snprintf(line0, sizeof(line0), "%-16s", "1-Water 2-Light");
-            snprintf(line1, sizeof(line1), "%-16s", "3-Climate 4-RST");
-        } else if (g_settingsLevel == 1) {
-            if (g_settingsSubsystem == 1) {
-                snprintf(line0, sizeof(line0), "%-16s", "1-SoilDry");
-                snprintf(line1, sizeof(line1), "%-16s", "2-WtrLvl");
-            } else if (g_settingsSubsystem == 3) {
-                snprintf(line0, sizeof(line0), "%-16s", "1-HumLw 2-HumHi");
-                snprintf(line1, sizeof(line1), "%-16s", "3-TmpCl 4-TmpWr");
-            }
+            LCD_SetCursor(0, 0);
+            LCD_Print(line0);
+            LCD_SetCursor(1, 0);
+            LCD_Print(line1);
         }
-        LCD_SetCursor(0, 0);
-        LCD_Print(line0);
-        LCD_SetCursor(1, 0);
-        LCD_Print(line1);
+
+        osMutexRelease(lcdMutexHandle);
+        lastLcdTick = HAL_GetTick();
     }
 
-    osMutexRelease(lcdMutexHandle);
-    osDelay(500); // refresh every 500ms
+    char kp_key = keypad_get_key();
+    if (kp_key) {
+        uint8_t cmd = 0;
+        if (kp_key >= '0' && kp_key <= '9') cmd = kp_key;
+        else if (kp_key == 'E') cmd = '\r';
+        else if (kp_key == 'F') cmd = 0x1B;
+        else if (kp_key == 'A') cmd = 'A';
+        else if (kp_key == 'D') cmd = 'D';
+        else if (kp_key == 'B') cmd = 'S';
+        else if (kp_key == 'C') cmd = (currentScreen == 3 && g_editMode) ? '\b' : 0x1B;
+        if (cmd) handle_keypress(cmd);
+    }
+
+    osDelay(50);
   }
   /* USER CODE END 5 */
 }
